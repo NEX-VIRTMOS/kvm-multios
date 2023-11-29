@@ -5,6 +5,7 @@
 
 set -Eeuo pipefail
 
+#---------      Global variable     -------------------
 LIBVIRT_DEFAULT_IMAGES_PATH="/var/lib/libvirt/images"
 OVMF_DEFAULT_PATH=/usr/share/OVMF
 LIBVIRT_DEFAULT_LOG_PATH="/var/log/libvirt/qemu"
@@ -31,6 +32,47 @@ FILE_SERVER_DAEMON_PID=
 FILE_SERVER_IP="192.168.122.1"
 FILE_SERVER_PORT=8000
 
+#---------      Functions    -------------------
+declare -F "check_non_symlink" >/dev/null || function check_non_symlink() {
+    if [[ $# -eq 1 ]]; then
+        if [[ -L "$1" ]]; then
+            echo "Error: $1 is a symlink."
+            exit -1
+        fi
+    else
+        echo "Error: Invalid param to ${FUNCNAME[0]}"
+        exit -1
+    fi
+}
+
+declare -F "check_dir_valid" >/dev/null || function check_dir_valid() {
+    if [[ $# -eq 1 ]]; then
+        check_non_symlink "$1"
+        dpath=$(realpath "$1")
+        if [[ $? -ne 0 || ! -d $dpath ]]; then
+            echo "Error: $dpath invalid directory"
+            exit -1
+        fi
+    else
+        echo "Error: Invalid param to ${FUNCNAME[0]}"
+        exit -1
+    fi
+}
+
+declare -F "check_file_valid_nonzero" >/dev/null || function check_file_valid_nonzero() {
+    if [[ $# -eq 1 ]]; then
+        check_non_symlink "$1"
+        fpath=$(realpath "$1")
+        if [[ $? -ne 0 || ! -f $fpath || ! -s $fpath ]]; then
+            echo "Error: $fpath invalid/zero sized"
+            exit -1
+        fi
+    else
+        echo "Error: Invalid param to ${FUNCNAME[0]}"
+        exit -1
+    fi
+}
+
 function copy_setup_files() {
     # copy required files for use in guest
     local dest=$1
@@ -50,19 +92,23 @@ function copy_setup_files() {
         echo "Dest location to copy setup required files is not a directory"
         return -1
     fi
+    check_dir_valid $dest_path
 
     for script in ${host_scripts[@]}; do
+        check_file_valid_nonzero "$host_scriptpath/$script"
         cp -a $host_scriptpath/$script $dest_path/
     done
 
     local guest_files=()
     readarray -d '' guest_files < <(find "$guest_scriptpath/" -maxdepth 1 -mindepth 1 -type f -not -name "linux-image*.deb" -not -name "linux-headers*.deb")
     for file in ${guest_files[@]}; do
+        check_file_valid_nonzero $file
         cp -a $file $dest_path/
     done
 
     for file in ${REQUIRED_DEB_FILES[@]}; do
         dfile=$(echo "$file" | sed -r 's/-rt//')
+        check_file_valid_nonzero $guest_scriptpath/$file
         cp -a $guest_scriptpath/$file $dest_path/$dfile
     done
 
@@ -137,6 +183,38 @@ function is_host_kernel_local_install() {
   fi
 }
 
+function download_ubuntu_iso() {
+  local maxcount=10
+  local count=0
+
+  if [[ -z ${1+x} || -z $1 ]]; then
+    echo "Error: no dest tmp path provided"
+    return -1
+  fi
+  local dest_tmp_path=$1
+  while [[ $count -lt $maxcount ]]; do
+    count=$((count+1))
+    echo "$count: Download Ubuntu 22.04 iso"
+    #sudo wget -O ${LIBVIRT_DEFAULT_IMAGES_PATH}/${UBUNTU_INSTALLER_ISO} https://releases.ubuntu.com/22.04.2/ubuntu-22.04.2-live-server-amd64.iso
+    
+    wget -O $dest_tmp_path/${UBUNTU_INSTALLER_ISO} 'https://cdimage.ubuntu.com/releases/jammy/release/inteliot/ubuntu-22.04-live-server-amd64+intel-iot.iso' || return -1
+    wget -O $dest_tmp_path/SHA256SUMS https://cdimage.ubuntu.com/releases/jammy/release/inteliot/SHA256SUMS || return -1
+    local isochksum=$(sha256sum $dest_tmp_path/${UBUNTU_INSTALLER_ISO} | awk '{print $1}')
+    local verifychksum=$(cat $dest_tmp_path/SHA256SUMS | grep ubuntu-22.04-live-server-amd64+intel-iot.iso | awk '{print $1}')
+    if [[ "$isochksum" == "$verifychksum" ]]; then
+      # downloaded iso is okay.
+      echo "Verified Ubuntu iso checksum as expected: $isochksum"
+      sudo mv $dest_tmp_path/${UBUNTU_INSTALLER_ISO} ${LIBVIRT_DEFAULT_IMAGES_PATH}/${UBUNTU_INSTALLER_ISO}
+      sudo chown root:root ${LIBVIRT_DEFAULT_IMAGES_PATH}/${UBUNTU_INSTALLER_ISO}
+      break
+    fi
+  done
+  if [[ $count -ge $maxcount ]]; then
+    return -1
+  fi
+  return 0
+}
+
 function install_ubuntu() {
   local script=$(realpath "${BASH_SOURCE[0]}")
   local scriptpath=$(dirname "$script")
@@ -157,18 +235,16 @@ function install_ubuntu() {
 	fi
   done
 
-  if [[ ! -f "${LIBVIRT_DEFAULT_IMAGES_PATH}/${UBUNTU_INSTALLER_ISO}" ]]; then
-    echo "Download Ubuntu 22.04.2 iso"
-    #sudo wget -O ${LIBVIRT_DEFAULT_IMAGES_PATH}/${UBUNTU_INSTALLER_ISO} https://releases.ubuntu.com/22.04.2/ubuntu-22.04.2-live-server-amd64.iso
-    sudo wget -O ${LIBVIRT_DEFAULT_IMAGES_PATH}/${UBUNTU_INSTALLER_ISO} https://cdimage.ubuntu.com/releases/jammy/release/inteliot/ubuntu-22.04-live-server-amd64+intel-iot.iso
-  fi
-
   install_dep || return -1
   if [[ -d "$dest_tmp_path" ]]; then
     rm -rf "$dest_tmp_path"
   fi
   mkdir -p "$dest_tmp_path"
   TMP_FILES+=("$dest_tmp_path")
+
+  if [[ ! -f "${LIBVIRT_DEFAULT_IMAGES_PATH}/${UBUNTU_INSTALLER_ISO}" ]]; then
+    download_ubuntu_iso "$dest_tmp_path" || return -1
+  fi
 
   copy_setup_files "$dest_tmp_path" || return -1
   run_file_server "$dest_tmp_path" $FILE_SERVER_IP $FILE_SERVER_PORT FILE_SERVER_DAEMON_PID || return -1
@@ -308,7 +384,7 @@ function parse_arg() {
                 return -1
                 ;;
             *)
-                echo "unknown option: $1"
+                echo "Error: Unknown option: $1"
                 return -1
                 ;;
         esac
@@ -346,15 +422,13 @@ function cleanup () {
 }
 
 #-------------    main processes    -------------
-parse_arg "$@" || exit -1
+trap 'echo "Error line ${LINENO}: $BASH_COMMAND"' ERR
 
+parse_arg "$@" || exit -1
 if [[ $FORCE_KERN_FROM_DEB == "1" && -n $FORCE_KERN_APT_VER ]]; then
     echo "--force-kern-from-deb and --force-kern-apt-version cannot be used together"
-    exit
+    exit -1
 fi
-
-trap 'cleanup' EXIT
-trap 'echo "Error line ${LINENO}: $BASH_COMMAND"' ERR
 
 if [[ $FORCECLEAN == "1" ]]; then
     clean_ubuntu_images || exit -1
@@ -363,8 +437,9 @@ fi
 if [[ -f "${LIBVIRT_DEFAULT_IMAGES_PATH}/${UBUNTU_IMAGE_NAME}" ]]; then
     echo "${LIBVIRT_DEFAULT_IMAGES_PATH}/${UBUNTU_IMAGE_NAME} present"
     echo "Use --force option to force clean and re-install ubuntu"
-    exit
+    exit -1
 fi
+trap 'cleanup' EXIT
 
 install_ubuntu || exit -1
 

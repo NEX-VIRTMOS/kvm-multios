@@ -61,6 +61,32 @@ LOGD="logger -t $LOGTAG"
 LOGE="logger -s -t $LOGTAG"
 
 #---------      Functions    -------------------
+declare -F "check_non_symlink" >/dev/null || function check_non_symlink() {
+    if [[ $# -eq 1 ]]; then
+        if [[ -L "$1" ]]; then
+            echo "Error: $1 is a symlink."
+            exit -1
+        fi
+    else
+        echo "Error: Invalid param to ${FUNCNAME[0]}"
+        exit -1
+    fi
+}
+
+declare -F "check_file_valid_nonzero" >/dev/null || function check_file_valid_nonzero() {
+    if [[ $# -eq 1 ]]; then
+        check_non_symlink "$1"
+        fpath=$(realpath "$1")
+        if [[ $? -ne 0 || ! -f $fpath || ! -s $fpath ]]; then
+            echo "Error: $fpath invalid/zero sized"
+            exit -1
+        fi
+    else
+        echo "Error: Invalid param to ${FUNCNAME[0]}"
+        exit -1
+    fi
+}
+
 function check_url() {
     local url=$1
 
@@ -78,10 +104,11 @@ function check_url() {
 
 function install_kernel_from_deb() {
     $LOGD "${FUNCNAME[0]} begin"
-    if [ -z $1 ]; then
+    if [ -z "${1+x}" || -z $1 ]; then
         $LOGE "Error: empty path to kernel debs"
         return -1
     fi
+    check_file_valid_nonzero $1
     local path=$(realpath $1)
     if [ ! -d $path ]; then
         $LOGE "Error: invalid path to linux-header and linux-image debs given.($path)"
@@ -349,7 +376,7 @@ function parse_arg() {
         case $1 in
             -h|-\?|--help)
                 show_help
-                exit
+                exit 0
                 ;;
 
             -k)
