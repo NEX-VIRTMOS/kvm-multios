@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright (c) 2023-2025 Intel Corporation.
+# Copyright (c) 2023-2026 Intel Corporation.
 # All rights reserved.
 
 set -Eeuo pipefail
@@ -154,6 +154,36 @@ function clean_windows_images() {
   rm -f "/tmp/${WIN_OPENSSH_MSI_URL}"
 }
 
+function validate_zc_driver_content() {
+  local zipfile="$1"
+  local expected_type="$2" # "installer" or "non-installer"
+
+  # List contents of zip file
+  local zip_contents
+  zip_contents=$(unzip -l "$zipfile" 2>&1) || {
+    echo "Error: Failed to read zip archive $(basename "$zipfile"). May be corrupted."
+    return 255
+  }
+
+  if [[ "$expected_type" == "non-installer" ]]; then
+    # Expect: ZCBuild_[digits]_MSFT_Signed/ with DVInstaller.ps1
+    if ! echo "$zip_contents" | grep -q "ZCBuild_[0-9]*_MSFT_Signed/DVInstaller.ps1"; then
+      echo "Error: ZCBuild_MSFT_Signed.zip missing expected structure or may be incorrectly named."
+      echo "       Expected: ZCBuild_*_MSFT_Signed/DVInstaller.ps1"
+      return 255
+    fi
+  elif [[ "$expected_type" == "installer" ]]; then
+    # Expect: ZCBuild_*_Installer/ZC_Installer/ZeroCopyInstaller.exe
+    if ! echo "$zip_contents" | grep -q "ZCBuild_.*_Installer/ZC_Installer/ZeroCopyInstaller.exe"; then
+      echo "Error: ZCBuild_MSFT_Signed_Installer.zip missing expected structure or may be incorrectly named."
+      echo "       Expected: ZCBuild_*_Installer/ZC_Installer/ZeroCopyInstaller.exe"
+      return 255
+    fi
+  fi
+
+  return 0
+}
+
 function check_prerequisites() {
   local fileserverdir="$scriptpath/$WIN_UNATTEND_FOLDER"
 
@@ -173,9 +203,15 @@ function check_prerequisites() {
       if [[ $nfile -eq 0 && $nfile1 -eq 1 ]]; then
         SETUP_ZC_GUI_INSTALLER=1
         SETUP_ZC_FILENAME="ZCBuild_MSFT_Signed_Installer.zip"
+        # Validate zip content matches expected installer type
+        check_file_valid_nonzero "$fileserverdir/$SETUP_ZC_FILENAME"
+        validate_zc_driver_content "$fileserverdir/$SETUP_ZC_FILENAME" "installer" || return 255
       elif [[ $nfile -eq 1 && $nfile1 -eq 0 ]]; then
         SETUP_ZC_GUI_INSTALLER=0
         SETUP_ZC_FILENAME="ZCBuild_MSFT_Signed.zip"
+        # Validate zip content matches expected non-installer type
+        check_file_valid_nonzero "$fileserverdir/$SETUP_ZC_FILENAME"
+        validate_zc_driver_content "$fileserverdir/$SETUP_ZC_FILENAME" "non-installer" || return 255
       else
         echo "Error: Only one of $file in $fileserverdir allowed for installation!"
         return 255

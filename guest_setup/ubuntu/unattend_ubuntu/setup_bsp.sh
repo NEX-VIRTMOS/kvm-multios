@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright (c) 2023-2025 Intel Corporation.
+# Copyright (c) 2023-2026 Intel Corporation.
 # All rights reserved.
 
 set -Eeuo pipefail
@@ -76,6 +76,7 @@ NO_BSP_INSTALL=0
 KERN_PATH=""
 KERN_INSTALL_FROM_PPA=0
 KERN_PPA_VER=""
+INSTALLED_KERN_VER=""
 LINUX_FW_PPA_VER=""
 RT=0
 DRM_DRV_SUPPORTED=('i915' 'xe')
@@ -247,6 +248,7 @@ function install_kernel_from_deb() {
 
     # Update boot menu to boot to the new kernel
     kernel_version=$(dpkg --info "$path"/linux-headers.deb | grep "Package: " | awk -F 'linux-headers-' '{print $2}')
+    INSTALLED_KERN_VER="$kernel_version"
     sudo sed -i -r -e "s/GRUB_DEFAULT=.*/GRUB_DEFAULT='Advanced options for Ubuntu>Ubuntu, with Linux $kernel_version'/" /etc/default/grub
     sudo update-grub
 
@@ -270,6 +272,7 @@ function install_kernel_from_ppa() {
     # Update boot menu to boot to the new kernel
     local kernel_name
     kernel_name=$(echo "$1" | awk -F '=' '{print $1}')
+    INSTALLED_KERN_VER="$kernel_name"
     sudo sed -i -r -e "s/GRUB_DEFAULT=.*/GRUB_DEFAULT='Advanced options for Ubuntu>Ubuntu, with Linux $kernel_name'/" /etc/default/grub
     sudo update-grub
 
@@ -386,8 +389,8 @@ function validate_packages_availability() {
             continue
         fi
 
-        # Version is specified, verify it's available
-        if apt-cache madison "$pkg_name" 2>/dev/null | grep -q "$pkg_version"; then
+        # Version is specified, verify it's available using apt-cache madison
+        if apt-cache madison "$pkg_name" 2>/dev/null | awk '{print $3}' | grep -Fqx "$pkg_version"; then
             validated_list+="$pkg "
             continue
         fi
@@ -442,8 +445,28 @@ function install_userspace_pkgs() {
     # Select the appropriate package list based on detected Ubuntu version
     $LOGD "Detected Ubuntu version: $UBUNTU_VERSION ($UBUNTU_CODENAME)"
 
+    # Use the kernel version that was saved during kernel installation
+    local kernel_version="$INSTALLED_KERN_VER"
+    if [[ -n "$kernel_version" ]]; then
+        $LOGD "Using installed kernel version: $kernel_version"
+    fi
+
+    # Extract major.minor version (e.g., 6.18 from 6.18-intel or 6.12 from 6.12-intel)
+    local kernel_major_minor=""
+    if [[ -n "$kernel_version" ]]; then
+        kernel_major_minor=$(echo "$kernel_version" | grep -oP '^\d+\.\d+')
+    fi
+
     # Look up the package variable name for this version
     local package_var_name="${BSP_PACKAGE_VERSION_MAP[$UBUNTU_VERSION]:-$BSP_PACKAGE_DEFAULT}"
+
+    # Check if there's a kernel-specific package list
+    if [[ -n "$kernel_major_minor" && -n "${BSP_PACKAGE_KERNEL_MAP[$UBUNTU_VERSION:$kernel_major_minor]:-}" ]]; then
+        package_var_name="${BSP_PACKAGE_KERNEL_MAP[$UBUNTU_VERSION:$kernel_major_minor]}"
+        $LOGD "Using kernel-specific package list for kernel $kernel_major_minor: $package_var_name"
+    else
+        $LOGD "Using default package list for Ubuntu $UBUNTU_VERSION: $package_var_name"
+    fi
 
     # Use indirect variable expansion to get the package list
     local selected_packages="${!package_var_name}"
@@ -462,11 +485,16 @@ function install_userspace_pkgs() {
     done
     IFS="$old_ifs"
 
-    # Add additional packages
+    # Add version to linux-firmware if specified
     if [[ -n $LINUX_FW_PPA_VER ]]; then
-        package_list+="linux-firmware=$LINUX_FW_PPA_VER "
-    else
-        package_list+="linux-firmware "
+        if [[ "$package_list" == *"linux-firmware"* ]]; then
+            # Replace existing linux-firmware entry with versioned one
+            package_list=$(echo "$package_list" | sed -E 's/\blinux-firmware\b[[:space:]]*/linux-firmware='"$LINUX_FW_PPA_VER"' /g')
+        else
+            # linux-firmware not in package list, add it with specified version
+            $LOGD "INFO: -fw specified but linux-firmware not in package list, adding linux-firmware=$LINUX_FW_PPA_VER"
+            package_list+="linux-firmware=$LINUX_FW_PPA_VER "
+        fi
     fi
 
     # for SPICE with SRIOV cursor support
@@ -673,17 +701,12 @@ EndSection
 EOF
     fi
     # Add script to dynamically enable/disable SW cursor
-    if ! grep -Fq '/dev/virtio-ports/com.redhat.spice.0' /usr/local/bin/setup_sw_cursor.sh; then
+    if ! grep -Fq 'setup_sw_cursor.sh' /usr/local/bin/setup_sw_cursor.sh; then
         sudo tee -a "/usr/local/bin/setup_sw_cursor.sh" &>/dev/null <<EOF
 #!/bin/bash
-if [[ -e /dev/virtio-ports/com.redhat.spice.0 ]]; then
-    if grep -F '"SWcursor" "true"' /usr/share/X11/xorg.conf.d/20-modesetting.conf; then
-        sed -i "s/Option \"SWcursor\" \"true\"/Option \"SWcursor\" \"false\"/g" /usr/share/X11/xorg.conf.d/20-modesetting.conf
-    fi
-else
-    if grep -F '"SWcursor" "false"' /usr/share/X11/xorg.conf.d/20-modesetting.conf; then
-        sed -i "s/Option \"SWcursor\" \"false\"/Option \"SWcursor\" \"true\"/g" /usr/share/X11/xorg.conf.d/20-modesetting.conf
-    fi
+# Enable SW cursor for all display types
+if grep -F '"SWcursor" "false"' /usr/share/X11/xorg.conf.d/20-modesetting.conf; then
+    sed -i "s/Option \"SWcursor\" \"false\"/Option \"SWcursor\" \"true\"/g" /usr/share/X11/xorg.conf.d/20-modesetting.conf
 fi
 EOF
         sudo chmod 744 /usr/local/bin/setup_sw_cursor.sh
